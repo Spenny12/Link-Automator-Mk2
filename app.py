@@ -18,7 +18,6 @@ st.title("Automated Semantic Internal Linking Tool")
 
 @st.cache_resource
 def load_model():
-    """Loads the sentence transformer model once and caches it in memory."""
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 embedding_model = load_model()
@@ -27,15 +26,15 @@ embedding_model = load_model()
 with st.sidebar:
     st.header("Settings")
     gemini_api_key = st.text_input("Gemini API Key", type="password")
-    
+
     st.subheader("Site Discovery")
     sitemap_url = st.text_input("Sitemap URL", placeholder="https://example.com/sitemap.xml")
-    
+
     st.subheader("Target Pages (Incoming Links)")
     target_urls_input = st.text_area("URLs to build links TO (one per line)", height=150)
-    
+
     allow_new_copy = st.checkbox("Allow suggestions with NEW copy (1 line)")
-    
+
     run_button = st.button("Generate Link Suggestions")
 
     st.markdown("---")
@@ -57,27 +56,25 @@ def get_urls_from_sitemap(sitemap):
 def crawl_and_filter(urls):
     with tempfile.NamedTemporaryFile(suffix='.jl', delete=False) as tmp_file:
         filepath = tmp_file.name
-        
+
     try:
         adv.crawl(urls, filepath, custom_settings={'LOGLEVEL': 'ERROR'})
         df = pd.read_json(filepath, lines=True)
-        
-        # Filter for indexable, 200 status pages
+
         if 'status' in df.columns:
             df = df[df['status'] == 200]
-            
+
         if 'meta_robots' in df.columns:
             df = df[~df['meta_robots'].str.contains('noindex', na=False, case=False)]
-            
+
         if 'canonical' in df.columns:
             df = df[df['canonical'].isna() | (df['canonical'] == df['url'])]
-            
+
         if 'body_text' not in df.columns:
             df['body_text'] = df.get('title', '')
-            
+
         df['body_text'] = df['body_text'].fillna('')
 
-        # Ensure we capture the outgoing links for our new filter
         if 'links_url' not in df.columns:
             df['links_url'] = ''
         else:
@@ -93,39 +90,54 @@ def chunk_text(text, chunk_size=150):
     chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
     return [c for c in chunks if len(c.split()) > 20]
 
-def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy):
+def get_gemini_batch_suggestions(target_url, sources, allow_new_copy):
+    """Calls Gemini with MULTIPLE source paragraphs to ensure anchor text diversity."""
     genai.configure(api_key=gemini_api_key)
     model = genai.GenerativeModel('gemini-3-flash-preview')
 
+    sources_text = ""
+    for i, (src_url, src_chunk, _) in enumerate(sources):
+        sources_text += f"\n--- Source {i+1} ---\nURL: {src_url}\nParagraph Context:\n{src_chunk}\n"
+
     prompt = f"""
-    You are an expert SEO content strategist. Find a natural way to add an internal link from the "Source Paragraph" to the "Target Page".
-
+    You are an expert SEO content strategist.
     Target Page URL: {target_url}
-    Source Page URL: {source_url}
 
-    Source Paragraph (Context):
-    {source_chunk}
+    Below are {len(sources)} different source paragraphs from different pages on the same website.
+    For EACH source paragraph, find a natural way to add an internal link to the Target Page.
 
-    INSTRUCTIONS:
-    1. The anchor text MUST be highly relevant to the Target Page.
-    2. Suggest a link using EXISTING copy from the source paragraph. Provide the exact existing sentence and specify which words should be the anchor text.
+    CRITICAL RULE: The anchor text you suggest for each of the {len(sources)} paragraphs MUST be unique.
+    Do not use the exact same anchor text twice. They should be semantically similar, but use different words or phrasing.
+
+    {sources_text}
+
+    INSTRUCTIONS FOR EACH SOURCE:
+    1. Suggest a link using EXISTING copy from the source paragraph. Provide the exact existing sentence and the anchor text.
     """
 
     if allow_new_copy:
-        prompt += "\n3. Suggest a link using NEW copy. Write exactly ONE new sentence that fits naturally into the paragraph context, and specify the anchor text."
+        prompt += "2. Suggest a link using NEW copy. Write exactly ONE new sentence that fits naturally, and specify the anchor text.\n"
 
     prompt += """
-    Output the response in clean JSON format:
-    - "existing_copy_sentence": The full sentence from the text.
-    - "existing_copy_anchor": The exact words to hyperlink.
+    Output the response in clean JSON format matching this exact structure:
+    {
+      "suggestions": [
+        {
+          "source_url": "Insert exact Source URL here",
+          "existing_copy_sentence": "...",
+          "existing_copy_anchor": "..."
     """
     if allow_new_copy:
-        prompt += """
-    - "new_copy_sentence": The newly written one-line sentence.
-    - "new_copy_anchor": The exact words to hyperlink.
+        prompt += """,
+          "new_copy_sentence": "...",
+          "new_copy_anchor": "..."
+        """
+    prompt += """
+        }
+      ]
+    }
+    Return ONLY valid JSON. Do not use Markdown blocks.
     """
-
-    prompt += "\nReturn ONLY valid JSON. Do not use Markdown blocks."
 
     try:
         response = model.generate_content(prompt)
@@ -143,7 +155,7 @@ if clear_cache_button and sitemap_url:
         os.path.join(cache_dir, f"{domain_name}_faiss.index"),
         os.path.join(cache_dir, f"{domain_name}_chunks.pkl"),
         os.path.join(cache_dir, f"{domain_name}_url_text.pkl"),
-        os.path.join(cache_dir, f"{domain_name}_url_links.pkl") # NEW: clear the links cache too
+        os.path.join(cache_dir, f"{domain_name}_url_links.pkl")
     ]
 
     cleared = False
@@ -242,9 +254,10 @@ if run_button:
 
             st.success(f"Successfully cached data for {domain_name}!")
 
-    # --- Step 3: Semantic Search ---
-    st.info("Indexing Complete! Finding semantic matches and filtering out existing links...")
+    # --- Step 3: Semantic Search & Match Grouping ---
+    st.info("Indexing Complete! Finding matches and preparing batch queries...")
 
+    # We now group all matches for a single target into ONE task
     tasks = []
 
     for target_url in valid_targets:
@@ -252,14 +265,11 @@ if run_button:
         target_summary = ' '.join(target_text.split()[:300])
 
         target_vector = embedding_model.encode([target_summary]).astype('float32')
-
-        # INCREASED from 15 to 50: We need a wider net in case the top matches already link to the target
         distances, indices = faiss_index.search(target_vector, 50)
 
         found_sources = set()
-        found_matches = []
+        found_matches = [] # Will store tuples of (url, chunk_text, distance)
 
-        # Clean target URL for exact matching
         target_parsed = urlparse(target_url)
         target_url_clean = target_url.strip().strip('/')
         target_domain = target_parsed.netloc.replace("www.", "")
@@ -269,24 +279,19 @@ if run_button:
             match = chunk_data[idx]
             match_url = match['url']
 
-            # Skip if it's the target page itself, or if we already picked a chunk from this URL
             if match_url == target_url or match_url in found_sources:
                 continue
 
-            # --- NEW: Check if the source already links to the target ---
             source_links_str = url_to_links.get(match_url, '')
             source_links = [link.strip().strip('/') for link in source_links_str.split('@@') if link]
 
             link_exists = False
             for link in source_links:
                 link_clean = link
-
-                # Check 1: Exact string match
                 if target_url_clean == link_clean:
                     link_exists = True
                     break
 
-                # Check 2: Relative URL or structural match (e.g. trailing slash differences)
                 link_parsed = urlparse(link)
                 link_domain = link_parsed.netloc.replace("www.", "")
                 link_path = link_parsed.path.strip('/')
@@ -296,8 +301,7 @@ if run_button:
                     break
 
             if link_exists:
-                continue # Skip to the next closest semantic match!
-            # -------------------------------------------------------------
+                continue
 
             found_sources.add(match_url)
             found_matches.append((match_url, match['text'], dist))
@@ -305,15 +309,14 @@ if run_button:
             if len(found_matches) >= 3:
                 break
 
-        for match_url, chunk_text_match, dist in found_matches:
+        if found_matches:
+            # Create ONE task per target page containing all 3 source paragraphs
             tasks.append({
                 'target_url': target_url,
-                'source_url': match_url,
-                'source_chunk': chunk_text_match,
-                'distance': dist
+                'sources': found_matches
             })
 
-    # --- Step 4: Execute Tasks Concurrently ---
+    # --- Step 4: Execute Batch Tasks Concurrently ---
     results_map = {}
     progress_bar = st.progress(0)
 
@@ -324,10 +327,9 @@ if run_button:
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_task = {
             executor.submit(
-                get_gemini_suggestions,
+                get_gemini_batch_suggestions,
                 task['target_url'],
-                task['source_url'],
-                task['source_chunk'],
+                task['sources'],
                 allow_new_copy
             ): task for task in tasks
         }
@@ -338,19 +340,38 @@ if run_button:
             completed += 1
             progress_bar.progress(completed / len(tasks))
 
+            target_url = task['target_url']
+            sources_info = {src_url: dist for src_url, _, dist in task['sources']}
+            results_map[target_url] = []
+
             try:
-                suggestion = future.result()
+                batch_result = future.result()
+                if "error" in batch_result:
+                    # If the whole batch fails, record the error for each source
+                    for src_url in sources_info:
+                        results_map[target_url].append({
+                            'source_url': src_url,
+                            'distance': sources_info[src_url],
+                            'suggestion': {"error": batch_result["error"]}
+                        })
+                else:
+                    # Map the successful individual suggestions back to their original distances
+                    suggestions = batch_result.get("suggestions", [])
+                    for sugg in suggestions:
+                        src_url = sugg.get("source_url")
+                        if src_url in sources_info:
+                            results_map[target_url].append({
+                                'source_url': src_url,
+                                'distance': sources_info[src_url],
+                                'suggestion': sugg
+                            })
             except Exception as e:
-                suggestion = {"error": str(e)}
-
-            if task['target_url'] not in results_map:
-                results_map[task['target_url']] = []
-
-            results_map[task['target_url']].append({
-                'source_url': task['source_url'],
-                'distance': task['distance'],
-                'suggestion': suggestion
-            })
+                for src_url in sources_info:
+                    results_map[target_url].append({
+                        'source_url': src_url,
+                        'distance': sources_info[src_url],
+                        'suggestion': {"error": str(e)}
+                    })
 
     # --- Step 5: Render UI and Export CSV ---
     csv_data = []
