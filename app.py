@@ -415,7 +415,7 @@ for target_url in valid_targets:
                 "suggested link": formatted_suggestion
             })
 
-    if csv_data:
+if csv_data:
         st.markdown("---")
         st.subheader("Export Results")
         export_df = pd.DataFrame(csv_data)
