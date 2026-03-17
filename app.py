@@ -371,7 +371,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             })
 
     # --- Step 5: Render UI and Export CSV ---
-    csv_data = []
+csv_data = []
 
     for target_url in valid_targets:
         if target_url not in results_map:
