@@ -88,7 +88,7 @@ def chunk_text(text, chunk_size=150):
 
 def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy):
     genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-3-flash-preview')
     
     prompt = f"""
     You are an expert SEO content strategist. Find a natural way to add an internal link from the "Source Paragraph" to the "Target Page".
