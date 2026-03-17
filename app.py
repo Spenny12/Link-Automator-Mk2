@@ -6,7 +6,7 @@ import tempfile
 import json
 import os
 import concurrent.futures
-import google.generativeai as genai
+from google import genai
 from sentence_transformers import SentenceTransformer
 import faiss
 import pickle
@@ -93,9 +93,26 @@ def chunk_text(text, chunk_size=150):
     chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
     return [c for c in chunks if len(c.split()) > 20]
 
-def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy):
-    genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel('gemini-3-flash-preview')
+def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy, api_key): # (or whichever parameter setup you have right now)
+
+    # --- NEW GENAI SYNTAX ---
+    client = genai.Client(api_key=api_key)
+
+    prompt = f"""
+    You are an expert SEO content strategist...
+    [... keep all your prompt text exactly the same ...]
+    """
+
+    try:
+        # --- NEW GENERATE CALL ---
+        response = client.models.generate_content(
+            model='gemini-3flash-preview',
+            contents=prompt
+        )
+        clean_text = response.text.replace('```json', '').replace('```', '').strip()
+        return json.loads(clean_text)
+    except Exception as e:
+        return {"error": str(e)}
 
     prompt = f"""
     You are an expert SEO content strategist. Find a natural way to add an internal link from the "Source Paragraph" to the "Target Page".
