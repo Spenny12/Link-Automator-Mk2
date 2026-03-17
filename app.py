@@ -371,9 +371,9 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             })
 
     # --- Step 5: Render UI and Export CSV ---
-csv_data = []
+        csv_data = []
 
-for target_url in valid_targets:
+    for target_url in valid_targets:
         if target_url not in results_map:
             continue
 
@@ -415,7 +415,7 @@ for target_url in valid_targets:
                 "suggested link": formatted_suggestion
             })
 
-if csv_data:
+    if csv_data:
         st.markdown("---")
         st.subheader("Export Results")
         export_df = pd.DataFrame(csv_data)
