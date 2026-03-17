@@ -106,7 +106,7 @@ def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy,
     try:
         # --- NEW GENERATE CALL ---
         response = client.models.generate_content(
-            model='gemini-3flash-preview',
+            model='gemini-3-flash-preview',
             contents=prompt
         )
         clean_text = response.text.replace('```json', '').replace('```', '').strip()
