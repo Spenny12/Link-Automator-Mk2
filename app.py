@@ -338,14 +338,15 @@ if run_button:
         st.warning("Could not find any pages that don't already link to your target(s)!")
         st.stop()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_task = {
             executor.submit(
                 get_gemini_suggestions,
                 task['target_url'],
                 task['source_url'],
                 task['source_chunk'],
-                allow_new_copy
+                allow_new_copy,
+                gemini_api_key  # <--- ADD THIS LINE HERE
             ): task for task in tasks
         }
 
