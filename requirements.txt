@@ -2,6 +2,7 @@ streamlit
 advertools
 pandas
 numpy
-google-generativeai
+google-genai
+pydantic
 sentence-transformers
 faiss-cpu

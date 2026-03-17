@@ -6,11 +6,16 @@ import tempfile
 import json
 import os
 import concurrent.futures
-import google.generativeai as genai
+from urllib.parse import urlparse
+import pickle
+
+# --- NEW IMPORTS ---
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
+from typing import Optional
 from sentence_transformers import SentenceTransformer
 import faiss
-import pickle
-from urllib.parse import urlparse
 
 # --- Configuration & Caching ---
 st.set_page_config(page_title="Semantic Link Automator", layout="wide")
@@ -22,6 +27,14 @@ def load_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 embedding_model = load_model()
+
+# --- Schema Definition for Structured Output ---
+class LinkSuggestion(BaseModel):
+    existing_copy_sentence: str = Field(description="Exactly ONE existing sentence from the text.")
+    existing_copy_anchor: str = Field(description="The exact words to hyperlink.")
+    new_copy_sentence: Optional[str] = Field(description="Exactly ONE newly written sentence. Null if not requested.", default=None)
+    new_copy_anchor: Optional[str] = Field(description="The exact words to hyperlink in the new sentence. Null if not requested.", default=None)
+
 
 # --- UI Inputs ---
 with st.sidebar:
@@ -62,7 +75,6 @@ def crawl_and_filter(urls):
         adv.crawl(urls, filepath, custom_settings={'LOGLEVEL': 'ERROR'})
         df = pd.read_json(filepath, lines=True)
 
-        # Filter for indexable, 200 status pages
         if 'status' in df.columns:
             df = df[df['status'] == 200]
 
@@ -77,7 +89,6 @@ def crawl_and_filter(urls):
 
         df['body_text'] = df['body_text'].fillna('')
 
-        # Ensure we capture the outgoing links for our new filter
         if 'links_url' not in df.columns:
             df['links_url'] = ''
         else:
@@ -93,9 +104,9 @@ def chunk_text(text, chunk_size=150):
     chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
     return [c for c in chunks if len(c.split()) > 20]
 
-def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy):
-    genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel('gemini-3-flash-preview')
+def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy, api_key):
+    # Initialize the new genai client
+    client = genai.Client(api_key=api_key)
 
     prompt = f"""
     You are an expert SEO content strategist. Find a natural way to add an internal link from the "Source Paragraph" to the "Target Page".
@@ -114,23 +125,18 @@ def get_gemini_suggestions(target_url, source_url, source_chunk, allow_new_copy)
     if allow_new_copy:
         prompt += "\n3. Suggest a link using NEW copy. Write exactly ONE new sentence that fits naturally into the paragraph context, and specify the anchor text."
 
-    prompt += """
-    Output the response in clean JSON format:
-    - "existing_copy_sentence": The full sentence from the text.
-    - "existing_copy_anchor": The exact words to hyperlink.
-    """
-    if allow_new_copy:
-        prompt += """
-    - "new_copy_sentence": The newly written one-line sentence.
-    - "new_copy_anchor": The exact words to hyperlink.
-    """
-
-    prompt += "\nReturn ONLY valid JSON. Do not use Markdown blocks."
-
     try:
-        response = model.generate_content(prompt)
-        clean_text = response.text.replace('```json', '').replace('```', '').strip()
-        return json.loads(clean_text)
+        # Utilizing the new SDK and passing the Pydantic schema
+        response = client.models.generate_content(
+            model='gemini-3-flash-preview',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=LinkSuggestion,
+                temperature=0.2, # Lower temperature for strictly formatted tasks
+            ),
+        )
+        return json.loads(response.text)
     except Exception as e:
         return {"error": str(e)}
 
@@ -143,7 +149,7 @@ if clear_cache_button and sitemap_url:
         os.path.join(cache_dir, f"{domain_name}_faiss.index"),
         os.path.join(cache_dir, f"{domain_name}_chunks.pkl"),
         os.path.join(cache_dir, f"{domain_name}_url_text.pkl"),
-        os.path.join(cache_dir, f"{domain_name}_url_links.pkl") # NEW: clear the links cache too
+        os.path.join(cache_dir, f"{domain_name}_url_links.pkl")
     ]
 
     cleared = False
@@ -253,13 +259,11 @@ if run_button:
 
         target_vector = embedding_model.encode([target_summary]).astype('float32')
 
-        # INCREASED from 15 to 50: We need a wider net in case the top matches already link to the target
         distances, indices = faiss_index.search(target_vector, 50)
 
         found_sources = set()
         found_matches = []
 
-        # Clean target URL for exact matching
         target_parsed = urlparse(target_url)
         target_url_clean = target_url.strip().strip('/')
         target_domain = target_parsed.netloc.replace("www.", "")
@@ -269,11 +273,9 @@ if run_button:
             match = chunk_data[idx]
             match_url = match['url']
 
-            # Skip if it's the target page itself, or if we already picked a chunk from this URL
             if match_url == target_url or match_url in found_sources:
                 continue
 
-            # --- NEW: Check if the source already links to the target ---
             source_links_str = url_to_links.get(match_url, '')
             source_links = [link.strip().strip('/') for link in source_links_str.split('@@') if link]
 
@@ -281,12 +283,10 @@ if run_button:
             for link in source_links:
                 link_clean = link
 
-                # Check 1: Exact string match
                 if target_url_clean == link_clean:
                     link_exists = True
                     break
 
-                # Check 2: Relative URL or structural match (e.g. trailing slash differences)
                 link_parsed = urlparse(link)
                 link_domain = link_parsed.netloc.replace("www.", "")
                 link_path = link_parsed.path.strip('/')
@@ -296,12 +296,12 @@ if run_button:
                     break
 
             if link_exists:
-                continue # Skip to the next closest semantic match!
-            # -------------------------------------------------------------
+                continue
 
             found_sources.add(match_url)
             found_matches.append((match_url, match['text'], dist))
 
+            # Forces exactly 3 origin pages per target page
             if len(found_matches) >= 3:
                 break
 
@@ -328,7 +328,8 @@ if run_button:
                 task['target_url'],
                 task['source_url'],
                 task['source_chunk'],
-                allow_new_copy
+                allow_new_copy,
+                gemini_api_key  # Passing the API key locally per thread
             ): task for task in tasks
         }
 
@@ -382,7 +383,7 @@ if run_button:
 
                     formatted_suggestion += f"EXISTING COPY\nSentence: {existing_sentence}\nAnchor: {existing_anchor}"
 
-                    if allow_new_copy and "new_copy_sentence" in suggestion:
+                    if allow_new_copy and suggestion.get("new_copy_sentence"):
                         st.subheader("Option 2: Using New Copy")
                         new_sentence = suggestion.get('new_copy_sentence', 'N/A')
                         new_anchor = suggestion.get('new_copy_anchor', 'N/A')
